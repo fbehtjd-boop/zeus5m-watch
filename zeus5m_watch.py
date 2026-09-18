@@ -18,6 +18,9 @@ Pine "Zeus Switching Line v5"의 기본 설정을 그대로 이식했다.
   HTF_MAX_DIST_ATR    상위TF 종가~200EMA 최대 거리      (기본 1.2 ATR)
   HTF_TOUCH_BARS      터치 확인 룩백 봉수               (기본 6)
   HTF_TOUCH_ATR       터치 인정 허용 오차               (기본 0.35 ATR)
+  EMA_SLOPE_BARS      200EMA 기울기 측정 봉수           (기본 50)
+  EMA_SLOPE_MIN       기울기 최소값 (ATR 배수)          (기본 0.3)
+  ADX_MIN             ADX 하한 (0이면 미사용)           (기본 0)
   REQUIRE_ALIGN       50/200EMA 정배열까지 강제  1/0    (기본 0)
   COOLDOWN_MIN        동일 종목·방향 재알림 금지 분      (기본 90)
   WORKERS             동시 요청 수                      (기본 6)
@@ -49,6 +52,9 @@ TOP_N = int(os.getenv("TOP_N", "150"))
 HTF_MAX_DIST_ATR = float(os.getenv("HTF_MAX_DIST_ATR", "1.2"))
 HTF_TOUCH_BARS = int(os.getenv("HTF_TOUCH_BARS", "6"))
 HTF_TOUCH_ATR = float(os.getenv("HTF_TOUCH_ATR", "0.35"))
+EMA_SLOPE_BARS = int(os.getenv("EMA_SLOPE_BARS", "50"))
+EMA_SLOPE_MIN = float(os.getenv("EMA_SLOPE_MIN", "0.3"))
+ADX_MIN = float(os.getenv("ADX_MIN", "0"))
 REQUIRE_ALIGN = os.getenv("REQUIRE_ALIGN", "0") == "1"
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "90"))
 WORKERS = int(os.getenv("WORKERS", "6"))
@@ -115,6 +121,9 @@ def get_universe():
         sym = d.get("symbol", "")
         if not sym.endswith("-USDT"):
             continue
+        base = sym.split("-")[0]
+        if base.startswith("NCS") or base.startswith("PRE"):
+            continue          # 주식·지수 CFD, 상장전 선물 제외
         try:
             qv = float(d.get("quoteVolume") or 0)
         except (TypeError, ValueError):
@@ -172,6 +181,52 @@ def atr_rma(h, l, c, length=14):
     out[length - 1] = tr[:length].mean()
     for i in range(length, n):
         out[i] = (out[i - 1] * (length - 1) + tr[i]) / length
+    return out
+
+
+def adx(h, l, c, length=14):
+    """Wilder ADX"""
+    n = len(c)
+    if n < length * 3:
+        return np.full(n, np.nan)
+    tr = np.zeros(n)
+    pdm = np.zeros(n)
+    ndm = np.zeros(n)
+    for i in range(1, n):
+        up = h[i] - h[i - 1]
+        dn = l[i - 1] - l[i]
+        pdm[i] = up if (up > dn and up > 0) else 0.0
+        ndm[i] = dn if (dn > up and dn > 0) else 0.0
+        tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+
+    def rma(x):
+        out = np.full(n, np.nan)
+        out[length] = x[1:length + 1].mean()
+        for i in range(length + 1, n):
+            out[i] = (out[i - 1] * (length - 1) + x[i]) / length
+        return out
+
+    atr_ = rma(tr)
+    pdi = np.full(n, np.nan)
+    ndi = np.full(n, np.nan)
+    dx = np.full(n, np.nan)
+    rp, rn = rma(pdm), rma(ndm)
+    for i in range(length, n):
+        if atr_[i] and atr_[i] > 0:
+            pdi[i] = 100.0 * rp[i] / atr_[i]
+            ndi[i] = 100.0 * rn[i] / atr_[i]
+            sm = pdi[i] + ndi[i]
+            dx[i] = 100.0 * abs(pdi[i] - ndi[i]) / sm if sm > 0 else 0.0
+    out = np.full(n, np.nan)
+    st = length * 2
+    if st < n:
+        seg = dx[length:st + 1]
+        seg = seg[~np.isnan(seg)]
+        if len(seg):
+            out[st] = seg.mean()
+            for i in range(st + 1, n):
+                if not math.isnan(dx[i]):
+                    out[i] = (out[i - 1] * (length - 1) + dx[i]) / length
     return out
 
 
@@ -286,6 +341,7 @@ def htf_check(kl, side):
     """
     통과 조건
       방향 일치 : 롱=종가가 200EMA 위 / 숏=종가가 200EMA 아래
+      추세 존재 : 200EMA 기울기가 신호 방향으로 EMA_SLOPE_MIN ATR 이상 (평평한 구간 제외)
       근접     : |종가-200EMA| <= HTF_MAX_DIST_ATR * ATR
       터치     : 최근 HTF_TOUCH_BARS 봉 중 저가(롱)/고가(숏)가 200EMA 허용오차 안까지 들어옴
     """
@@ -295,6 +351,7 @@ def htf_check(kl, side):
     e200 = ema(c, 200)
     e50 = ema(c, 50)
     a = atr_rma(h, l, c, 14)
+    adx_ = adx(h, l, c, 14)
 
     px, em, atr = c[-1], e200[-1], a[-1]
     if math.isnan(atr) or atr <= 0:
@@ -304,16 +361,28 @@ def htf_check(kl, side):
     if dist > HTF_MAX_DIST_ATR:
         return None
 
+    # 200EMA 기울기 (ATR 정규화) — 평평한 횡보 구간 제외
+    k = min(EMA_SLOPE_BARS, len(c) - 1)
+    slope = (e200[-1] - e200[-1 - k]) / atr
+
+    adx_v = adx_[-1] if not math.isnan(adx_[-1]) else 0.0
+    if ADX_MIN > 0 and adx_v < ADX_MIN:
+        return None
+
     n = min(HTF_TOUCH_BARS, len(c))
     tol = HTF_TOUCH_ATR * atr
 
     if side == "long":
         if px <= em:
             return None
+        if slope < EMA_SLOPE_MIN:
+            return None
         touched = bool(np.any(l[-n:] <= e200[-n:] + tol))
         aligned = e50[-1] > e200[-1]
     else:
         if px >= em:
+            return None
+        if slope > -EMA_SLOPE_MIN:
             return None
         touched = bool(np.any(h[-n:] >= e200[-n:] - tol))
         aligned = e50[-1] < e200[-1]
@@ -323,7 +392,8 @@ def htf_check(kl, side):
     if REQUIRE_ALIGN and not aligned:
         return None
 
-    return {"dist": dist, "aligned": aligned, "ema200": em, "ema50": e50[-1]}
+    return {"dist": dist, "aligned": aligned, "ema200": em,
+            "ema50": e50[-1], "slope": slope, "adx": adx_v}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -376,8 +446,9 @@ def scan_symbol(symbol):
 # ──────────────────────────────────────────────────────────────
 # 알림 / 로그
 # ──────────────────────────────────────────────────────────────
-def tv_link(symbol):
-    return f"https://www.tradingview.com/chart/?symbol=BINGX%3A{symbol.replace('-', '')}.P"
+def tv_ticker(symbol):
+    """트레이딩뷰 검색창에 그대로 붙여넣는 형식"""
+    return f"BINGX:{symbol.replace('-', '')}.P"
 
 
 def build_msg(r):
@@ -391,10 +462,11 @@ def build_msg(r):
     for m in r["matched"]:
         al = "정배열" if m["aligned"] else "역배열"
         lines.append(
-            f"{m['tf'].upper()} {role} · 이격 {m['dist']:.2f}ATR · {al} "
-            f"(EMA200 {m['ema200']:.8g})"
+            f"{m['tf'].upper()} {role} · 이격 {m['dist']:.2f}ATR · "
+            f"기울기 {m['slope']:+.2f} · ADX {m['adx']:.0f} · {al}"
         )
-    lines.append(tv_link(r["symbol"]))
+    lines.append("")
+    lines.append(f"<code>{tv_ticker(r['symbol'])}</code>")
     return "\n".join(lines)
 
 
@@ -406,7 +478,7 @@ def send_tg(text):
     try:
         SESSION.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": text,
+            json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML",
                   "disable_web_page_preview": True},
             timeout=15,
         )
@@ -424,13 +496,14 @@ def write_log(r):
             w = csv.writer(f)
             if new:
                 w.writerow(["시각", "심볼", "방향", "가격", "충족TF",
-                            "이격ATR", "정배열", "EMA200"])
+                            "이격ATR", "기울기", "ADX", "정배열", "EMA200"])
             m = r["matched"][0]
             w.writerow([
                 f"{now_kst():%Y-%m-%d %H:%M}", r["symbol"], r["side"],
                 f"{r['price']:.10g}",
                 "+".join(x["tf"] for x in r["matched"]),
-                f"{m['dist']:.3f}", int(m["aligned"]), f"{m['ema200']:.10g}",
+                f"{m['dist']:.3f}", f"{m['slope']:.3f}", f"{m['adx']:.1f}",
+                int(m["aligned"]), f"{m['ema200']:.10g}",
             ])
     except Exception as e:
         log(f"로그 기록 실패: {e}")
