@@ -24,9 +24,12 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TOP_N: '300'
-          HTF_MAX_DIST_ATR: '5'
-          HTF_TOUCH_BARS: '30'
-          HTF_TOUCH_ATR: '3'
+          HTF_MAX_DIST_ATR: '1.2'
+          HTF_TOUCH_BARS: '6'
+          HTF_TOUCH_ATR: '0.35'
+          EMA_SLOPE_BARS: '50'
+          EMA_SLOPE_MIN: '0.3'
+          ADX_MIN: '0'
           REQUIRE_ALIGN: '0'
           COOLDOWN_MIN: '90'
           WORKERS: '8'
