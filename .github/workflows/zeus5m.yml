@@ -1,3 +1,33 @@
-          HTF_MAX_DIST_ATR: '5'
-          HTF_TOUCH_BARS: '30'
-          HTF_TOUCH_ATR: '3'
+name: zeus5m-watch
+
+on:
+  schedule:
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: zeus5m
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: run
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TOP_N: '300'
+          HTF_MAX_DIST_ATR: '1.2'
+          HTF_TOUCH_BARS: '6'
+          HTF_TOUCH_ATR: '0.35'
+          REQUIRE_ALIGN: '0'
+          COOLDOWN_MIN: '90'
+          WORKERS: '8'
+        run: python zeus5m_watch.py
